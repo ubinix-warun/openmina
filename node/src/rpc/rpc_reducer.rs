@@ -1,3 +1,8 @@
+use ledger::scan_state::transaction_logic::valid;
+use mina_p2p_messages::v2::{
+    MinaBaseSignedCommandStableV2, MinaBaseZkappCommandTStableV1WireStableV1, NonZeroCurvePoint,
+    TransactionSnarkWorkTStableV2,
+};
 use openmina_core::{
     block::AppliedBlock,
     bug_condition,
@@ -14,14 +19,15 @@ use redux::ActionWithMeta;
 use crate::{
     ledger::read::{LedgerReadAction, LedgerReadInitCallback, LedgerReadRequest},
     p2p_ready,
-    rpc::GetBlockQuery,
+    rpc::{GetBlockQuery, PooledCommandsQuery},
     rpc_effectful::RpcEffectfulAction,
     TransactionPoolAction,
 };
 
 use super::{
-    PeerConnectionStatus, RpcAction, RpcPeerInfo, RpcRequest, RpcRequestExtraData, RpcRequestState,
-    RpcRequestStatus, RpcScanStateSummaryGetQuery, RpcSnarkerConfig, RpcState,
+    ConsensusTimeQuery, PeerConnectionStatus, RpcAction, RpcPeerInfo, RpcRequest,
+    RpcRequestExtraData, RpcRequestState, RpcRequestStatus, RpcScanStateSummaryGetQuery,
+    RpcSnarkerConfig, RpcState,
 };
 
 impl RpcState {
@@ -326,6 +332,34 @@ impl RpcState {
                     rpc_id: *rpc_id,
                     job_id: job_id.clone(),
                 });
+            }
+            RpcAction::SnarkPoolCompletedJobsGet { rpc_id } => {
+                let (dispatcher, state) = state_context.into_dispatcher_and_state();
+
+                let jobs = state
+                    .snark_pool
+                    .completed_snarks_iter()
+                    .map(|s| TransactionSnarkWorkTStableV2::from(s.clone()))
+                    .collect::<Vec<_>>();
+
+                dispatcher.push(RpcEffectfulAction::SnarkPoolCompletedJobsGet {
+                    rpc_id: *rpc_id,
+                    jobs,
+                });
+            }
+            RpcAction::SnarkPoolPendingJobsGet { rpc_id } => {
+                let (dispatcher, state) = state_context.into_dispatcher_and_state();
+
+                let jobs = state
+                    .snark_pool
+                    .available_jobs_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                dispatcher.push(RpcEffectfulAction::SnarkPoolPendingJobsGet {
+                    rpc_id: *rpc_id,
+                    jobs,
+                })
             }
             RpcAction::SnarkerConfigGet { rpc_id } => {
                 let (dispatcher, state) = state_context.into_dispatcher_and_state();
@@ -651,6 +685,201 @@ impl RpcState {
                 });
                 dispatcher
                     .push(P2pConnectionIncomingAction::AnswerSendSuccess { peer_id: *peer_id });
+            }
+            RpcAction::PooledUserCommands { rpc_id, query } => {
+                let (dispatcher, state) = state_context.into_dispatcher_and_state();
+
+                let PooledCommandsQuery {
+                    public_key,
+                    hashes,
+                    ids,
+                } = query;
+
+                let all_transactions = state.transaction_pool.get_all_transactions();
+
+                let mut user_commands: Vec<_> = all_transactions
+                    .into_iter()
+                    .filter_map(|tx| match tx.data {
+                        valid::UserCommand::SignedCommand(signed_command) => Some((
+                            tx.hash,
+                            MinaBaseSignedCommandStableV2::from(*signed_command),
+                        )),
+                        valid::UserCommand::ZkAppCommand(_) => None,
+                    })
+                    .collect();
+
+                if let Some(pk) = public_key {
+                    let pk = NonZeroCurvePoint::from(pk.clone());
+                    user_commands.retain(|(_, tx)| tx.signer == pk)
+                }
+
+                if let Some(hashes) = hashes {
+                    user_commands.retain(|(hash, _)| hashes.contains(hash))
+                }
+
+                if let Some(ids) = ids {
+                    user_commands.retain(|(_, tx)| ids.contains(tx))
+                }
+
+                dispatcher.push(RpcEffectfulAction::PooledUserCommands {
+                    rpc_id: *rpc_id,
+                    user_commands: user_commands.into_iter().map(|(_, tx)| tx).collect(),
+                });
+            }
+            RpcAction::GenesisBlock { rpc_id } => {
+                let (dispatcher, state) = state_context.into_dispatcher_and_state();
+                let genesis_block = state.genesis_block();
+                dispatcher.push(RpcEffectfulAction::GenesisBlock {
+                    rpc_id: *rpc_id,
+                    genesis_block,
+                });
+            }
+            RpcAction::PooledZkappCommands { rpc_id, query } => {
+                let (dispatcher, state) = state_context.into_dispatcher_and_state();
+
+                let PooledCommandsQuery {
+                    public_key,
+                    hashes,
+                    ids,
+                } = query;
+
+                let all_transactions = state.transaction_pool.get_all_transactions();
+
+                let mut zkapp_commands: Vec<_> = all_transactions
+                    .into_iter()
+                    .filter_map(|tx| match tx.data {
+                        valid::UserCommand::SignedCommand(_) => None,
+                        valid::UserCommand::ZkAppCommand(zkapp) => Some((
+                            tx.hash,
+                            MinaBaseZkappCommandTStableV1WireStableV1::from(&zkapp.zkapp_command),
+                        )),
+                    })
+                    .collect();
+
+                if let Some(pk) = public_key {
+                    let pk = NonZeroCurvePoint::from(pk.clone());
+                    zkapp_commands.retain(|(_, tx)| tx.fee_payer.body.public_key == pk);
+                }
+
+                if let Some(hashes) = hashes {
+                    zkapp_commands.retain(|(hash, _)| hashes.contains(hash));
+                }
+
+                if let Some(ids) = ids {
+                    zkapp_commands.retain(|(_, tx)| ids.contains(tx));
+                }
+
+                dispatcher.push(RpcEffectfulAction::PooledZkappCommands {
+                    rpc_id: *rpc_id,
+                    zkapp_commands: zkapp_commands.into_iter().map(|(_, tx)| tx).collect(),
+                });
+            }
+            RpcAction::ConsensusTimeGet { rpc_id, query } => {
+                let (dispatcher, state) = state_context.into_dispatcher_and_state();
+                let consensus_time = match query {
+                    ConsensusTimeQuery::Now => state.consensus_time_now(),
+                    ConsensusTimeQuery::BestTip => state.consensus_time_best_tip(),
+                };
+                println!("consensus_time: {:?}", consensus_time);
+                dispatcher.push(RpcEffectfulAction::ConsensusTimeGet {
+                    rpc_id: *rpc_id,
+                    consensus_time,
+                });
+            }
+            RpcAction::LedgerStatusGetInit {
+                rpc_id,
+                ledger_hash,
+            } => {
+                let rpc_state = RpcRequestState {
+                    req: RpcRequest::LedgerStatusGet(ledger_hash.clone()),
+                    status: RpcRequestStatus::Init { time: meta.time() },
+                    data: Default::default(),
+                };
+                state.requests.insert(*rpc_id, rpc_state);
+
+                let (dispatcher, state) = state_context.into_dispatcher_and_state();
+                let ledger_hash = if let Some(best_tip) = state.transition_frontier.best_tip() {
+                    best_tip.merkle_root_hash()
+                } else {
+                    return;
+                };
+
+                dispatcher.push(LedgerReadAction::Init {
+                    request: LedgerReadRequest::GetLedgerStatus(*rpc_id, ledger_hash.clone()),
+                    callback: LedgerReadInitCallback::RpcLedgerStatusGetPending {
+                        callback: redux::callback!(
+                            on_ledger_read_init_rpc_actions_get_init(rpc_id: RequestId<RpcIdType>) -> crate::Action{
+                                RpcAction::LedgerStatusGetPending { rpc_id }
+                            }
+                        ),
+                        args: *rpc_id,
+                    },
+                })
+            }
+            RpcAction::LedgerStatusGetPending { rpc_id } => {
+                let Some(rpc) = state.requests.get_mut(rpc_id) else {
+                    return;
+                };
+                rpc.status = RpcRequestStatus::Pending { time: meta.time() };
+            }
+            RpcAction::LedgerStatusGetSuccess { rpc_id, response } => {
+                let Some(rpc) = state.requests.get_mut(rpc_id) else {
+                    return;
+                };
+                rpc.status = RpcRequestStatus::Success { time: meta.time() };
+
+                let dispatcher = state_context.into_dispatcher();
+                dispatcher.push(RpcEffectfulAction::LedgerStatusGetSuccess {
+                    rpc_id: *rpc_id,
+                    response: response.clone(),
+                });
+            }
+            RpcAction::LedgerAccountDelegatorsGetInit {
+                rpc_id,
+                ledger_hash,
+                account_id,
+            } => {
+                let rpc_state = RpcRequestState {
+                    req: RpcRequest::LedgerAccountDelegatorsGet(
+                        ledger_hash.clone(),
+                        account_id.clone(),
+                    ),
+                    status: RpcRequestStatus::Init { time: meta.time() },
+                    data: Default::default(),
+                };
+                state.requests.insert(*rpc_id, rpc_state);
+
+                let dispatcher = state_context.into_dispatcher();
+
+                dispatcher.push(LedgerReadAction::Init {
+                    request: LedgerReadRequest::GetAccountDelegators(*rpc_id, ledger_hash.clone(), account_id.clone()),
+                    callback: LedgerReadInitCallback::RpcLedgerAccountDelegatorsGetPending {
+                        callback: redux::callback!(
+                            on_ledger_read_init_rpc_actions_get_init(rpc_id: RequestId<RpcIdType>) -> crate::Action{
+                                RpcAction::LedgerAccountDelegatorsGetPending { rpc_id }
+                            }
+                        ),
+                        args: *rpc_id,
+                    },
+                })
+            }
+            RpcAction::LedgerAccountDelegatorsGetPending { rpc_id } => {
+                let Some(rpc) = state.requests.get_mut(rpc_id) else {
+                    return;
+                };
+                rpc.status = RpcRequestStatus::Pending { time: meta.time() };
+            }
+            RpcAction::LedgerAccountDelegatorsGetSuccess { rpc_id, response } => {
+                let Some(rpc) = state.requests.get_mut(rpc_id) else {
+                    return;
+                };
+                rpc.status = RpcRequestStatus::Success { time: meta.time() };
+
+                let dispatcher = state_context.into_dispatcher();
+                dispatcher.push(RpcEffectfulAction::LedgerAccountDelegatorsGetSuccess {
+                    rpc_id: *rpc_id,
+                    response: response.clone(),
+                });
             }
         }
     }

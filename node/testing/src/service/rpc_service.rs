@@ -51,6 +51,14 @@ impl RpcService for super::NodeTestingService {
         node::rpc::RpcSnarkPoolJobGetResponse,
     );
     to_real!(
+        respond_snark_pool_completed_jobs_get,
+        node::rpc::RpcSnarkPoolCompletedJobsResponse,
+    );
+    to_real!(
+        respond_snark_pool_pending_jobs_get,
+        node::rpc::RpcSnarkPoolPendingJobsGetResponse
+    );
+    to_real!(
         respond_snarker_job_commit,
         node::rpc::RpcSnarkerJobCommitResponse,
     );
@@ -109,4 +117,25 @@ impl RpcService for super::NodeTestingService {
         node::rpc::RpcTransactionStatusGetResponse,
     );
     to_real!(respond_block_get, node::rpc::RpcGetBlockResponse,);
+    to_real!(
+        respond_pooled_user_commands,
+        node::rpc::RpcPooledUserCommandsResponse,
+    );
+    to_real!(
+        respond_pooled_zkapp_commands,
+        node::rpc::RpcPooledZkappCommandsResponse,
+    );
+    to_real!(respond_genesis_block, node::rpc::RpcGenesisBlockResponse,);
+    to_real!(
+        respond_consensus_time_get,
+        node::rpc::RpcConsensusTimeGetResponse,
+    );
+    to_real!(
+        respond_ledger_status_get,
+        node::rpc::RpcLedgerStatusGetResponse,
+    );
+    to_real!(
+        respond_ledger_account_delegators_get,
+        node::rpc::RpcLedgerAccountDelegatorsGetResponse,
+    );
 }

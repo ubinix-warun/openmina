@@ -473,15 +473,23 @@ pub enum ActionKind {
     RpcBlockGet,
     RpcBlockProducerStatsGet,
     RpcConsensusConstantsGet,
+    RpcConsensusTimeGet,
     RpcDiscoveryBoostrapStats,
     RpcDiscoveryRoutingTable,
     RpcFinish,
+    RpcGenesisBlock,
     RpcGlobalStateGet,
     RpcHealthCheck,
     RpcHeartbeatGet,
+    RpcLedgerAccountDelegatorsGetInit,
+    RpcLedgerAccountDelegatorsGetPending,
+    RpcLedgerAccountDelegatorsGetSuccess,
     RpcLedgerAccountsGetInit,
     RpcLedgerAccountsGetPending,
     RpcLedgerAccountsGetSuccess,
+    RpcLedgerStatusGetInit,
+    RpcLedgerStatusGetPending,
+    RpcLedgerStatusGetSuccess,
     RpcMessageProgressGet,
     RpcP2pConnectionIncomingAnswerReady,
     RpcP2pConnectionIncomingError,
@@ -494,13 +502,17 @@ pub enum ActionKind {
     RpcP2pConnectionOutgoingPending,
     RpcP2pConnectionOutgoingSuccess,
     RpcPeersGet,
+    RpcPooledUserCommands,
+    RpcPooledZkappCommands,
     RpcReadinessCheck,
     RpcScanStateSummaryGetInit,
     RpcScanStateSummaryGetPending,
     RpcScanStateSummaryGetSuccess,
     RpcScanStateSummaryLedgerGetInit,
     RpcSnarkPoolAvailableJobsGet,
+    RpcSnarkPoolCompletedJobsGet,
     RpcSnarkPoolJobGet,
+    RpcSnarkPoolPendingJobsGet,
     RpcSnarkerConfigGet,
     RpcSnarkerJobCommit,
     RpcSnarkerJobSpec,
@@ -520,12 +532,16 @@ pub enum ActionKind {
     RpcEffectfulBlockGet,
     RpcEffectfulBlockProducerStatsGet,
     RpcEffectfulConsensusConstantsGet,
+    RpcEffectfulConsensusTimeGet,
     RpcEffectfulDiscoveryBoostrapStats,
     RpcEffectfulDiscoveryRoutingTable,
+    RpcEffectfulGenesisBlock,
     RpcEffectfulGlobalStateGet,
     RpcEffectfulHealthCheck,
     RpcEffectfulHeartbeatGet,
+    RpcEffectfulLedgerAccountDelegatorsGetSuccess,
     RpcEffectfulLedgerAccountsGetSuccess,
+    RpcEffectfulLedgerStatusGetSuccess,
     RpcEffectfulMessageProgressGet,
     RpcEffectfulP2pConnectionIncomingError,
     RpcEffectfulP2pConnectionIncomingRespond,
@@ -533,10 +549,14 @@ pub enum ActionKind {
     RpcEffectfulP2pConnectionOutgoingError,
     RpcEffectfulP2pConnectionOutgoingSuccess,
     RpcEffectfulPeersGet,
+    RpcEffectfulPooledUserCommands,
+    RpcEffectfulPooledZkappCommands,
     RpcEffectfulReadinessCheck,
     RpcEffectfulScanStateSummaryGetSuccess,
     RpcEffectfulSnarkPoolAvailableJobsGet,
+    RpcEffectfulSnarkPoolCompletedJobsGet,
     RpcEffectfulSnarkPoolJobGet,
+    RpcEffectfulSnarkPoolPendingJobsGet,
     RpcEffectfulSnarkerConfigGet,
     RpcEffectfulSnarkerJobCommit,
     RpcEffectfulSnarkerJobSpec,
@@ -718,7 +738,7 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
-    pub const COUNT: u16 = 608;
+    pub const COUNT: u16 = 628;
 }
 
 impl std::fmt::Display for ActionKind {
@@ -1064,6 +1084,8 @@ impl ActionKindGet for RpcAction {
             Self::ScanStateSummaryGetSuccess { .. } => ActionKind::RpcScanStateSummaryGetSuccess,
             Self::SnarkPoolAvailableJobsGet { .. } => ActionKind::RpcSnarkPoolAvailableJobsGet,
             Self::SnarkPoolJobGet { .. } => ActionKind::RpcSnarkPoolJobGet,
+            Self::SnarkPoolCompletedJobsGet { .. } => ActionKind::RpcSnarkPoolCompletedJobsGet,
+            Self::SnarkPoolPendingJobsGet { .. } => ActionKind::RpcSnarkPoolPendingJobsGet,
             Self::SnarkerConfigGet { .. } => ActionKind::RpcSnarkerConfigGet,
             Self::SnarkerJobCommit { .. } => ActionKind::RpcSnarkerJobCommit,
             Self::SnarkerJobSpec { .. } => ActionKind::RpcSnarkerJobSpec,
@@ -1088,6 +1110,22 @@ impl ActionKindGet for RpcAction {
             Self::ConsensusConstantsGet { .. } => ActionKind::RpcConsensusConstantsGet,
             Self::TransactionStatusGet { .. } => ActionKind::RpcTransactionStatusGet,
             Self::BlockGet { .. } => ActionKind::RpcBlockGet,
+            Self::ConsensusTimeGet { .. } => ActionKind::RpcConsensusTimeGet,
+            Self::LedgerStatusGetInit { .. } => ActionKind::RpcLedgerStatusGetInit,
+            Self::LedgerStatusGetPending { .. } => ActionKind::RpcLedgerStatusGetPending,
+            Self::LedgerStatusGetSuccess { .. } => ActionKind::RpcLedgerStatusGetSuccess,
+            Self::LedgerAccountDelegatorsGetInit { .. } => {
+                ActionKind::RpcLedgerAccountDelegatorsGetInit
+            }
+            Self::LedgerAccountDelegatorsGetPending { .. } => {
+                ActionKind::RpcLedgerAccountDelegatorsGetPending
+            }
+            Self::LedgerAccountDelegatorsGetSuccess { .. } => {
+                ActionKind::RpcLedgerAccountDelegatorsGetSuccess
+            }
+            Self::PooledUserCommands { .. } => ActionKind::RpcPooledUserCommands,
+            Self::PooledZkappCommands { .. } => ActionKind::RpcPooledZkappCommands,
+            Self::GenesisBlock { .. } => ActionKind::RpcGenesisBlock,
             Self::Finish { .. } => ActionKind::RpcFinish,
         }
     }
@@ -1126,6 +1164,10 @@ impl ActionKindGet for RpcEffectfulAction {
                 ActionKind::RpcEffectfulSnarkPoolAvailableJobsGet
             }
             Self::SnarkPoolJobGet { .. } => ActionKind::RpcEffectfulSnarkPoolJobGet,
+            Self::SnarkPoolCompletedJobsGet { .. } => {
+                ActionKind::RpcEffectfulSnarkPoolCompletedJobsGet
+            }
+            Self::SnarkPoolPendingJobsGet { .. } => ActionKind::RpcEffectfulSnarkPoolPendingJobsGet,
             Self::SnarkerConfigGet { .. } => ActionKind::RpcEffectfulSnarkerConfigGet,
             Self::SnarkerJobCommit { .. } => ActionKind::RpcEffectfulSnarkerJobCommit,
             Self::SnarkerJobSpec { .. } => ActionKind::RpcEffectfulSnarkerJobSpec,
@@ -1154,6 +1196,14 @@ impl ActionKindGet for RpcEffectfulAction {
             Self::ConsensusConstantsGet { .. } => ActionKind::RpcEffectfulConsensusConstantsGet,
             Self::TransactionStatusGet { .. } => ActionKind::RpcEffectfulTransactionStatusGet,
             Self::BlockGet { .. } => ActionKind::RpcEffectfulBlockGet,
+            Self::PooledUserCommands { .. } => ActionKind::RpcEffectfulPooledUserCommands,
+            Self::PooledZkappCommands { .. } => ActionKind::RpcEffectfulPooledZkappCommands,
+            Self::GenesisBlock { .. } => ActionKind::RpcEffectfulGenesisBlock,
+            Self::ConsensusTimeGet { .. } => ActionKind::RpcEffectfulConsensusTimeGet,
+            Self::LedgerStatusGetSuccess { .. } => ActionKind::RpcEffectfulLedgerStatusGetSuccess,
+            Self::LedgerAccountDelegatorsGetSuccess { .. } => {
+                ActionKind::RpcEffectfulLedgerAccountDelegatorsGetSuccess
+            }
         }
     }
 }

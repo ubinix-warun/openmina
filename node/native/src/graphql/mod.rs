@@ -1,33 +1,50 @@
-use block::GraphQLBlock;
-use juniper::{graphql_value, FieldError};
-use juniper::{EmptySubscription, GraphQLEnum, RootNode};
-use ledger::Account;
-use mina_p2p_messages::v2::MinaBaseSignedCommandStableV2;
-use mina_p2p_messages::v2::MinaBaseUserCommandStableV2;
-use mina_p2p_messages::v2::MinaBaseZkappCommandTStableV1WireStableV1;
-use mina_p2p_messages::v2::TokenIdKeyHash;
-use node::rpc::RpcTransactionInjectResponse;
-use node::rpc::{GetBlockQuery, RpcGetBlockResponse, RpcTransactionStatusGetResponse};
+use account::{create_account_loader, AccountLoader, GraphQLAccount};
+use block::{GraphQLBlock, GraphQLSnarkJob, GraphQLUserCommands};
+use juniper::{graphql_value, EmptySubscription, FieldError, GraphQLEnum, RootNode};
+use ledger::{Account, AccountId};
+use mina_p2p_messages::v2::{
+    conv, LedgerHash, MinaBaseSignedCommandStableV2, MinaBaseUserCommandStableV2,
+    MinaBaseZkappCommandTStableV1WireStableV1, TokenIdKeyHash, TransactionHash,
+};
+use mina_signer::CompressedPubKey;
+use node::rpc::RpcSnarkerConfig;
 use node::{
     account::AccountPublicKey,
-    rpc::{AccountQuery, RpcRequest, RpcSyncStatsGetResponse, SyncStatsQuery},
+    ledger::read::LedgerStatus,
+    rpc::{
+        AccountQuery, GetBlockQuery, PooledCommandsQuery, RpcBestChainResponse,
+        RpcGenesisBlockResponse, RpcGetBlockResponse, RpcLedgerAccountDelegatorsGetResponse,
+        RpcLedgerStatusGetResponse, RpcNodeStatus, RpcPooledUserCommandsResponse,
+        RpcPooledZkappCommandsResponse, RpcRequest, RpcSnarkPoolCompletedJobsResponse,
+        RpcSnarkPoolPendingJobsGetResponse, RpcStatusGetResponse, RpcSyncStatsGetResponse,
+        RpcTransactionInjectResponse, RpcTransactionStatusGetResponse, SyncStatsQuery,
+    },
     stats::sync::SyncKind,
+    BuildEnv,
 };
 use o1_utils::field_helpers::FieldHelpersError;
-use openmina_core::block::AppliedBlock;
-use openmina_core::consensus::ConsensusConstants;
-use openmina_core::constants::constraint_constants;
+use openmina_core::{
+    block::AppliedBlock, consensus::ConsensusConstants, constants::constraint_constants,
+    NetworkConfig,
+};
 use openmina_node_common::rpc::RpcSender;
+use snark::{GraphQLPendingSnarkWork, GraphQLSnarkWorker};
 use std::str::FromStr;
+use tokio::sync::OnceCell;
 use transaction::GraphQLTransactionStatus;
 use warp::{Filter, Rejection, Reply};
+use zkapp::GraphQLZkapp;
 
 pub mod account;
 pub mod block;
 pub mod constants;
+pub mod snark;
 pub mod transaction;
 pub mod user_command;
 pub mod zkapp;
+
+/// Base58 encoded public key
+pub type GraphQLPublicKey = String;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -51,6 +68,8 @@ pub enum ConversionError {
     SerdeJson(#[from] serde_json::Error),
     #[error("Base58Check: {0}")]
     Base58Check(#[from] mina_p2p_messages::b58::FromBase58CheckError),
+    #[error("Base58 error: {0}")]
+    Base58(#[from] bs58::decode::Error),
     #[error(transparent)]
     InvalidDecimalNumber(#[from] mina_p2p_messages::bigint::InvalidDecimalNumber),
     #[error("Invalid bigint")]
@@ -71,6 +90,8 @@ pub enum ConversionError {
     Custom(String),
     #[error(transparent)]
     FieldHelpers(#[from] FieldHelpersError),
+    #[error("Failed to convert integer to i32")]
+    Integer,
 }
 
 impl From<ConversionError> for Error {
@@ -79,9 +100,92 @@ impl From<ConversionError> for Error {
     }
 }
 
-struct Context(RpcSender);
+/// Context for the GraphQL API
+///
+/// This is used to share state between the GraphQL queries and mutations.
+///
+/// The caching used here is only valid for the lifetime of the context
+/// i.e. for one request which is the goal as we can have multiple sources for one request.
+/// This optimizes the number of request to the state machine
+pub(crate) struct Context {
+    rpc_sender: RpcSender,
+    account_loader: AccountLoader,
+    // Caches
+    statemachine_status_cache: OnceCell<Option<RpcNodeStatus>>,
+    best_tip_cache: OnceCell<Option<AppliedBlock>>,
+    ledger_status_cache: OnceCell<Option<LedgerStatus>>,
+}
 
 impl juniper::Context for Context {}
+
+impl Context {
+    pub fn new(rpc_sender: RpcSender) -> Self {
+        Self {
+            rpc_sender: rpc_sender.clone(),
+            statemachine_status_cache: OnceCell::new(),
+            best_tip_cache: OnceCell::new(),
+            ledger_status_cache: OnceCell::new(),
+            account_loader: create_account_loader(rpc_sender.clone()),
+        }
+    }
+
+    pub(crate) async fn get_or_fetch_status(&self) -> RpcStatusGetResponse {
+        self.statemachine_status_cache
+            .get_or_init(|| async {
+                self.rpc_sender
+                    .oneshot_request(RpcRequest::StatusGet)
+                    .await
+                    .flatten()
+            })
+            .await
+            .clone()
+    }
+
+    pub(crate) async fn get_or_fetch_best_tip(&self) -> Option<AppliedBlock> {
+        self.best_tip_cache
+            .get_or_init(|| async {
+                self.rpc_sender
+                    .oneshot_request(RpcRequest::BestChain(1))
+                    .await
+                    .and_then(|blocks: RpcBestChainResponse| blocks.first().cloned())
+            })
+            .await
+            .clone()
+    }
+
+    pub(crate) async fn get_or_fetch_ledger_status(
+        &self,
+        ledger_hash: &LedgerHash,
+    ) -> RpcLedgerStatusGetResponse {
+        self.ledger_status_cache
+            .get_or_init(|| async {
+                self.rpc_sender
+                    .oneshot_request(RpcRequest::LedgerStatusGet(ledger_hash.clone()))
+                    .await
+                    .flatten()
+            })
+            .await
+            .clone()
+    }
+
+    pub(crate) async fn load_account(&self, account_id: AccountId) -> Option<GraphQLAccount> {
+        self.account_loader.try_load(account_id).await.ok()?.ok()
+    }
+
+    pub async fn fetch_delegators(
+        &self,
+        ledger_hash: LedgerHash,
+        account_id: AccountId,
+    ) -> RpcLedgerAccountDelegatorsGetResponse {
+        self.rpc_sender
+            .oneshot_request(RpcRequest::LedgerAccountDelegatorsGet(
+                ledger_hash.clone(),
+                account_id.clone(),
+            ))
+            .await
+            .flatten()
+    }
+}
 
 #[derive(Clone, Copy, Debug, GraphQLEnum)]
 #[allow(clippy::upper_case_acronyms)]
@@ -159,16 +263,20 @@ struct Query;
 impl Query {
     async fn account(
         public_key: String,
-        token: String,
+        token: Option<String>,
         context: &Context,
     ) -> juniper::FieldResult<account::GraphQLAccount> {
-        let token_id = TokenIdKeyHash::from_str(&token)?;
         let public_key = AccountPublicKey::from_str(&public_key)?;
+        let req = match token {
+            None => AccountQuery::SinglePublicKey(public_key),
+            Some(token) => {
+                let token_id = TokenIdKeyHash::from_str(&token)?;
+                AccountQuery::PubKeyWithTokenId(public_key, token_id)
+            }
+        };
         let accounts: Vec<Account> = context
-            .0
-            .oneshot_request(RpcRequest::LedgerAccountsGet(
-                AccountQuery::PubKeyWithTokenId(public_key, token_id),
-            ))
+            .rpc_sender
+            .oneshot_request(RpcRequest::LedgerAccountsGet(req))
             .await
             .ok_or(Error::StateMachineEmptyResponse)?;
 
@@ -181,7 +289,7 @@ impl Query {
 
     async fn sync_status(context: &Context) -> juniper::FieldResult<SyncStatus> {
         let state: RpcSyncStatsGetResponse = context
-            .0
+            .rpc_sender
             .oneshot_request(RpcRequest::SyncStatsGet(SyncStatsQuery { limit: Some(1) }))
             .await
             .ok_or(Error::StateMachineEmptyResponse)?;
@@ -205,7 +313,7 @@ impl Query {
         context: &Context,
     ) -> juniper::FieldResult<Vec<GraphQLBlock>> {
         let best_chain: Vec<AppliedBlock> = context
-            .0
+            .rpc_sender
             .oneshot_request(RpcRequest::BestChain(max_length as u32))
             .await
             .ok_or(Error::StateMachineEmptyResponse)?;
@@ -217,23 +325,16 @@ impl Query {
     }
 
     async fn daemon_status(
-        context: &Context,
+        _context: &Context,
     ) -> juniper::FieldResult<constants::GraphQLDaemonStatus> {
-        let consensus_constants: ConsensusConstants = context
-            .0
-            .oneshot_request(RpcRequest::ConsensusConstantsGet)
-            .await
-            .ok_or(Error::StateMachineEmptyResponse)?;
-        Ok(constants::GraphQLDaemonStatus {
-            consensus_configuration: consensus_constants.into(),
-        })
+        Ok(constants::GraphQLDaemonStatus)
     }
 
     async fn genesis_constants(
         context: &Context,
     ) -> juniper::FieldResult<constants::GraphQLGenesisConstants> {
         let consensus_constants: ConsensusConstants = context
-            .0
+            .rpc_sender
             .oneshot_request(RpcRequest::ConsensusConstantsGet)
             .await
             .ok_or(Error::StateMachineEmptyResponse)?;
@@ -272,7 +373,7 @@ impl Query {
             .into());
         };
         let res: RpcTransactionStatusGetResponse = context
-            .0
+            .rpc_sender
             .oneshot_request(RpcRequest::TransactionStatusGet(tx))
             .await
             .ok_or(Error::StateMachineEmptyResponse)?;
@@ -298,7 +399,7 @@ impl Query {
         };
 
         let res: Option<RpcGetBlockResponse> = context
-            .0
+            .rpc_sender
             .oneshot_request(RpcRequest::GetBlock(query.clone()))
             .await;
 
@@ -319,6 +420,153 @@ impl Query {
             Some(Some(block)) => Ok(GraphQLBlock::try_from(block)?),
         }
     }
+
+    /// Retrieve all the scheduled user commands for a specified sender that
+    /// the current daemon sees in its transaction pool. All scheduled
+    /// commands are queried if no sender is specified
+    ///
+    /// Arguments:
+    /// - `public_key`: base58 encoded [`AccountPublicKey`]
+    /// - `hashes`: list of base58 encoded [`TransactionHash`]es
+    /// - `ids`: list of base64 encoded [`MinaBaseZkappCommandTStableV1WireStableV1`]
+    async fn pooled_user_commands(
+        &self,
+        public_key: Option<String>,
+        hashes: Option<Vec<String>>,
+        ids: Option<Vec<String>>,
+        context: &Context,
+    ) -> juniper::FieldResult<Vec<GraphQLUserCommands>> {
+        let query = parse_pooled_commands_query(
+            public_key,
+            hashes,
+            ids,
+            MinaBaseSignedCommandStableV2::from_base64,
+        )?;
+
+        let res: RpcPooledUserCommandsResponse = context
+            .rpc_sender
+            .oneshot_request(RpcRequest::PooledUserCommands(query))
+            .await
+            .ok_or(Error::StateMachineEmptyResponse)?;
+
+        Ok(res
+            .into_iter()
+            .map(GraphQLUserCommands::try_from)
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Retrieve all the scheduled zkApp commands for a specified sender that
+    ///  the current daemon sees in its transaction pool. All scheduled
+    ///  commands are queried if no sender is specified
+    ///
+    /// Arguments:
+    /// - `public_key`: base58 encoded [`AccountPublicKey`]
+    /// - `hashes`: list of base58 encoded [`TransactionHash`]es
+    /// - `ids`: list of base64 encoded [`MinaBaseZkappCommandTStableV1WireStableV1`]
+    async fn pooled_zkapp_commands(
+        public_key: Option<String>,
+        hashes: Option<Vec<String>>,
+        ids: Option<Vec<String>>,
+        context: &Context,
+    ) -> juniper::FieldResult<Vec<GraphQLZkapp>> {
+        let query = parse_pooled_commands_query(
+            public_key,
+            hashes,
+            ids,
+            MinaBaseZkappCommandTStableV1WireStableV1::from_base64,
+        )?;
+
+        let res: RpcPooledZkappCommandsResponse = context
+            .rpc_sender
+            .oneshot_request(RpcRequest::PooledZkappCommands(query))
+            .await
+            .ok_or(Error::StateMachineEmptyResponse)?;
+
+        Ok(res
+            .into_iter()
+            .map(GraphQLZkapp::try_from)
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    async fn genesis_block(context: &Context) -> juniper::FieldResult<GraphQLBlock> {
+        let block = context
+            .rpc_sender
+            .oneshot_request::<RpcGenesisBlockResponse>(RpcRequest::GenesisBlockGet)
+            .await
+            .ok_or(Error::StateMachineEmptyResponse)?
+            .ok_or(Error::StateMachineEmptyResponse)?;
+
+        Ok(GraphQLBlock::try_from(AppliedBlock {
+            block,
+            just_emitted_a_proof: false,
+        })?)
+    }
+
+    async fn snark_pool(context: &Context) -> juniper::FieldResult<Vec<GraphQLSnarkJob>> {
+        let jobs: RpcSnarkPoolCompletedJobsResponse = context
+            .rpc_sender
+            .oneshot_request(RpcRequest::SnarkPoolCompletedJobsGet)
+            .await
+            .ok_or(Error::StateMachineEmptyResponse)?;
+
+        Ok(jobs.iter().map(GraphQLSnarkJob::from).collect())
+    }
+
+    async fn pending_snark_work(
+        context: &Context,
+    ) -> juniper::FieldResult<Vec<GraphQLPendingSnarkWork>> {
+        let jobs: RpcSnarkPoolPendingJobsGetResponse = context
+            .rpc_sender
+            .oneshot_request(RpcRequest::SnarkPoolPendingJobsGet)
+            .await
+            .ok_or(Error::StateMachineEmptyResponse)?;
+
+        Ok(jobs
+            .into_iter()
+            .map(GraphQLPendingSnarkWork::try_from)
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The chain-agnostic identifier of the network
+    #[graphql(name = "networkID")]
+    async fn network_id(_context: &Context) -> juniper::FieldResult<String> {
+        let res = format!("mina:{}", NetworkConfig::global().name);
+        Ok(res)
+    }
+
+    /// The version of the node (git commit hash)
+    async fn version(_context: &Context) -> juniper::FieldResult<String> {
+        let res = BuildEnv::get().git.commit_hash;
+        Ok(res)
+    }
+
+    async fn current_snark_worker(
+        &self,
+        context: &Context,
+    ) -> juniper::FieldResult<Option<GraphQLSnarkWorker>> {
+        let config: Option<RpcSnarkerConfig> = context
+            .rpc_sender
+            .oneshot_request(RpcRequest::SnarkerConfig)
+            .await
+            .ok_or(Error::StateMachineEmptyResponse)?;
+
+        let Some(config) = config else {
+            return Ok(None);
+        };
+
+        let account = context
+            .load_account(AccountId {
+                public_key: CompressedPubKey::try_from(&config.public_key)?,
+                token_id: TokenIdKeyHash::default().into(),
+            })
+            .await;
+
+        Ok(Some(GraphQLSnarkWorker {
+            key: config.public_key.to_string(),
+            account,
+            fee: config.fee.to_string(),
+        }))
+    }
 }
 
 async fn inject_tx<R>(
@@ -329,7 +577,7 @@ where
     R: TryFrom<MinaBaseUserCommandStableV2>,
 {
     let res: RpcTransactionInjectResponse = context
-        .0
+        .rpc_sender
         .oneshot_request(RpcRequest::TransactionInject(vec![cmd]))
         .await
         .ok_or(Error::StateMachineEmptyResponse)?;
@@ -371,6 +619,7 @@ where
         }
     }
 }
+
 #[derive(Clone, Debug)]
 struct Mutation;
 
@@ -394,7 +643,7 @@ impl Mutation {
             .map_err(|e| Error::Conversion(ConversionError::Base58Check(e)))?;
 
         let accounts: Vec<Account> = context
-            .0
+            .rpc_sender
             .oneshot_request(RpcRequest::LedgerAccountsGet(
                 AccountQuery::PubKeyWithTokenId(public_key, token_id),
             ))
@@ -424,7 +673,7 @@ impl Mutation {
 
         // Grab the sender's account to get the infered nonce
         let accounts: Vec<Account> = context
-            .0
+            .rpc_sender
             .oneshot_request(RpcRequest::LedgerAccountsGet(
                 AccountQuery::PubKeyWithTokenId(public_key, token_id),
             ))
@@ -444,7 +693,7 @@ impl Mutation {
 pub fn routes(
     rpc_sernder: RpcSender,
 ) -> impl Filter<Error = Rejection, Extract = impl Reply> + Clone {
-    let state = warp::any().map(move || Context(rpc_sernder.clone()));
+    let state = warp::any().map(move || Context::new(rpc_sernder.clone()));
     let schema = RootNode::new(Query, Mutation, EmptySubscription::<Context>::new());
     let graphql_filter = juniper_warp::make_graphql_filter(schema, state.boxed());
     let graphiql_filter = juniper_warp::graphiql_filter("/graphql", None);
@@ -488,3 +737,44 @@ pub fn routes(
 //         )))
 //     .or(homepage)
 //     .with(log);
+
+/// Helper function used by [`Query::pooled_user_commands`] and [`Query::pooled_zkapp_commands`] to parse public key, transaction hashes and command ids
+fn parse_pooled_commands_query<ID, F>(
+    public_key: Option<String>,
+    hashes: Option<Vec<String>>,
+    ids: Option<Vec<String>>,
+    id_map_fn: F,
+) -> Result<PooledCommandsQuery<ID>, ConversionError>
+where
+    F: Fn(&str) -> Result<ID, conv::Error>,
+{
+    let public_key = match public_key {
+        Some(public_key) => Some(AccountPublicKey::from_str(&public_key)?),
+        None => None,
+    };
+
+    let hashes = match hashes {
+        Some(hashes) => Some(
+            hashes
+                .into_iter()
+                .map(|tx| TransactionHash::from_str(tx.as_str()))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        None => None,
+    };
+
+    let ids = match ids {
+        Some(ids) => Some(
+            ids.into_iter()
+                .map(|id| id_map_fn(id.as_str()))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        None => None,
+    };
+
+    Ok(PooledCommandsQuery {
+        public_key,
+        hashes,
+        ids,
+    })
+}

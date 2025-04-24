@@ -1,33 +1,92 @@
-use crate::graphql::zkapp::{GraphQLFailureReason, GraphQLFeePayer, GraphQLZkappCommand};
-use juniper::{GraphQLEnum, GraphQLObject};
-use mina_p2p_messages::v2::{
-    MinaBaseSignedCommandPayloadBodyStableV2, MinaBaseStakeDelegationStableV2,
-    TransactionSnarkWorkTStableV2,
+use crate::graphql::{
+    account::GraphQLAccount,
+    zkapp::{GraphQLFailureReason, GraphQLFeePayer, GraphQLZkappCommand},
 };
+use juniper::{graphql_object, FieldResult, GraphQLEnum, GraphQLObject};
+use ledger::AccountId;
+use mina_p2p_messages::v2::{
+    MinaBaseSignedCommandPayloadBodyStableV2, MinaBaseSignedCommandStableV2,
+    MinaBaseStakeDelegationStableV2, TransactionSnarkWorkTStableV2,
+};
+use mina_signer::CompressedPubKey;
+use node::account::AccountPublicKey;
 use openmina_core::block::AppliedBlock;
 
-use super::{account::GraphQLDummyAccount, zkapp::GraphQLZkapp, ConversionError};
+use super::{zkapp::GraphQLZkapp, Context, ConversionError};
 
-#[derive(GraphQLObject, Debug)]
-#[graphql(description = "A Mina block")]
+#[derive(Debug)]
 /// Location [src/lib/mina_graphql/types.ml:2095](https://github.com/MinaProtocol/mina/blob/develop/src/lib/mina_graphql/types.ml#L2095-L2151)
-pub struct GraphQLBlock {
-    pub creator: String,
-    /// TODO: this must be fetched separately from `AppliedBlock`
-    pub creator_account: GraphQLDummyAccount,
-    /// TODO: this must be fetched separately from `AppliedBlock`
-    pub winner_account: GraphQLDummyAccount,
-    pub state_hash: String,
+pub(crate) struct GraphQLBlock {
+    creator: String,
+    creator_account_key: CompressedPubKey,
+    winner_account_key: CompressedPubKey,
+    state_hash: String,
     /// Experimental: Bigint field-element representation of stateHash
-    pub state_hash_field: String,
-    pub protocol_state: GraphQLProtocolState,
+    state_hash_field: String,
+    protocol_state: GraphQLProtocolState,
     /// Public key of account that produced this block
     /// use creatorAccount field instead
-    pub transactions: GraphQLTransactions,
+    transactions: GraphQLTransactions,
     /// Base58Check-encoded hash of the state after this block
     /// Count of user command transactions in the block
-    pub command_transaction_count: i32,
-    pub snark_jobs: Vec<GraphQLSnarkJob>,
+    command_transaction_count: i32,
+    snark_jobs: Vec<GraphQLSnarkJob>,
+}
+
+#[graphql_object(context = Context)]
+#[graphql(description = "A Mina block")]
+impl GraphQLBlock {
+    fn creator(&self) -> &str {
+        &self.creator
+    }
+
+    async fn creator_account(&self, context: &Context) -> FieldResult<Box<GraphQLAccount>> {
+        let account_id = AccountId::new_with_default_token(self.creator_account_key.clone());
+        if let Some(account) = context.load_account(account_id).await {
+            Ok(Box::new(account))
+        } else {
+            Err(juniper::FieldError::new(
+                "Failed to load creator account".to_string(),
+                juniper::Value::null(),
+            ))
+        }
+    }
+    async fn winner_account(&self, context: &Context) -> FieldResult<Box<GraphQLAccount>> {
+        let account_id = AccountId::new_with_default_token(self.winner_account_key.clone());
+        if let Some(account) = context.load_account(account_id).await {
+            Ok(Box::new(account))
+        } else {
+            Err(juniper::FieldError::new(
+                "Failed to load winner account".to_string(),
+                juniper::Value::null(),
+            ))
+        }
+    }
+
+    async fn state_hash(&self) -> &str {
+        &self.state_hash
+    }
+
+    /// Experimental: Bigint field-element representation of stateHash
+    async fn state_hash_field(&self) -> &str {
+        &self.state_hash_field
+    }
+
+    async fn protocol_state(&self) -> &GraphQLProtocolState {
+        &self.protocol_state
+    }
+
+    async fn transactions(&self) -> &GraphQLTransactions {
+        &self.transactions
+    }
+
+    async fn command_transaction_count(&self) -> i32 {
+        self.command_transaction_count
+    }
+
+    async fn snark_jobs(&self) -> &Vec<GraphQLSnarkJob> {
+        &self.snark_jobs
+    }
 }
 
 #[derive(GraphQLObject, Debug)]
@@ -116,12 +175,12 @@ impl TryFrom<AppliedBlock> for GraphQLBlock {
             .collect();
 
         Ok(Self {
-            creator_account: GraphQLDummyAccount {
-                public_key: block.producer().to_string(),
-            },
-            winner_account: GraphQLDummyAccount {
-                public_key: block.block_stake_winner().to_string(),
-            },
+            creator_account_key: AccountPublicKey::from(block.producer().clone())
+                .try_into()
+                .map_err(|_| ConversionError::Custom("Invalid public key".to_string()))?,
+            winner_account_key: AccountPublicKey::from(block.block_stake_winner().clone())
+                .try_into()
+                .map_err(|_| ConversionError::Custom("Invalid public key".to_string()))?,
             protocol_state,
             state_hash: block.hash.to_string(),
             state_hash_field: block.hash.to_decimal(),
@@ -203,48 +262,7 @@ impl TryFrom<mina_p2p_messages::v2::StagedLedgerDiffDiffDiffStableV2> for GraphQ
         for command in commands {
             match command.data {
                 MinaBaseUserCommandStableV2::SignedCommand(user_command) => {
-                    let is_delegation = matches!(
-                        user_command.payload.body,
-                        MinaBaseSignedCommandPayloadBodyStableV2::StakeDelegation(_)
-                    );
-                    let hash = user_command.hash()?.to_string();
-
-                    let fee = user_command.payload.common.fee.to_string();
-                    let memo = user_command.payload.common.memo.to_base58check();
-                    let nonce = user_command.payload.common.nonce.as_u32() as i32;
-                    let valid_until = user_command.payload.common.valid_until.as_u32().to_string();
-
-                    let (to, amount, kind) = match user_command.payload.body {
-                        MinaBaseSignedCommandPayloadBodyStableV2::Payment(payment) => (
-                            payment.receiver_pk.to_string(),
-                            Some(payment.amount.to_string()),
-                            GraphQLUserCommandsKind::PAYMENT,
-                        ),
-                        MinaBaseSignedCommandPayloadBodyStableV2::StakeDelegation(
-                            MinaBaseStakeDelegationStableV2::SetDelegate { new_delegate },
-                        ) => (
-                            new_delegate.to_string(),
-                            None,
-                            GraphQLUserCommandsKind::STAKE_DELEGATION,
-                        ),
-                    };
-
-                    user_commands.push(GraphQLUserCommands {
-                        hash,
-                        from: user_command.signer.to_string(),
-                        to,
-                        is_delegation,
-                        amount,
-                        failure_reason: Default::default(),
-                        fee,
-                        fee_token: Default::default(),
-                        id: Default::default(),
-                        kind,
-                        memo,
-                        nonce,
-                        token: Default::default(),
-                        valid_until,
-                    });
+                    user_commands.push(GraphQLUserCommands::try_from(user_command)?);
                 }
                 MinaBaseUserCommandStableV2::ZkappCommand(zkapp) => {
                     let failure_reason =
@@ -375,5 +393,55 @@ impl From<&TransactionSnarkWorkTStableV2> for GraphQLSnarkJob {
             fee: value.fee.to_string(),
             prover: value.prover.to_string(),
         }
+    }
+}
+
+impl TryFrom<MinaBaseSignedCommandStableV2> for GraphQLUserCommands {
+    type Error = ConversionError;
+
+    fn try_from(user_command: MinaBaseSignedCommandStableV2) -> Result<Self, Self::Error> {
+        let is_delegation = matches!(
+            user_command.payload.body,
+            MinaBaseSignedCommandPayloadBodyStableV2::StakeDelegation(_)
+        );
+        let hash = user_command.hash()?.to_string();
+        let id = user_command.to_base64()?;
+
+        let fee = user_command.payload.common.fee.to_string();
+        let memo = user_command.payload.common.memo.to_base58check();
+        let nonce = user_command.payload.common.nonce.as_u32() as i32;
+        let valid_until = user_command.payload.common.valid_until.as_u32().to_string();
+
+        let (to, amount, kind) = match user_command.payload.body {
+            MinaBaseSignedCommandPayloadBodyStableV2::Payment(payment) => (
+                payment.receiver_pk.to_string(),
+                Some(payment.amount.to_string()),
+                GraphQLUserCommandsKind::PAYMENT,
+            ),
+            MinaBaseSignedCommandPayloadBodyStableV2::StakeDelegation(
+                MinaBaseStakeDelegationStableV2::SetDelegate { new_delegate },
+            ) => (
+                new_delegate.to_string(),
+                None,
+                GraphQLUserCommandsKind::STAKE_DELEGATION,
+            ),
+        };
+
+        Ok(GraphQLUserCommands {
+            hash,
+            from: user_command.signer.to_string(),
+            to,
+            is_delegation,
+            amount,
+            failure_reason: Default::default(),
+            fee,
+            fee_token: Default::default(),
+            id,
+            kind,
+            memo,
+            nonce,
+            token: Default::default(),
+            valid_until,
+        })
     }
 }
